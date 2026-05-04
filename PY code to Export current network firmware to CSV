@@ -1,0 +1,158 @@
+import os
+import csv
+import requests
+from datetime import datetime, timezone
+
+API_KEY = os.environ.get("MERAKI_API_KEY", "") # Add API or import from Environment variable
+ORG_ID = os.environ.get("MERAKI_ORG_ID", "") # Add ORG ID or import from Environment variable
+
+# Leave empty to export all visible networks
+TARGET_NETWORKS = [
+    "Melbourne - CBD Office",
+    "Perth - West Coast Hub",
+    "Sydney - North Shore Branch",
+]
+
+BASE_URL = "https://api.meraki.com/api/v1"
+
+HEADERS = {
+    "X-Cisco-Meraki-API-Key": API_KEY,
+    "Accept": "application/json"
+}
+
+
+def meraki_get(url, params=None):
+    results = []
+
+    while url:
+        response = requests.get(url, headers=HEADERS, params=params)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, list):
+            results.extend(data)
+        else:
+            return data
+
+        url = None
+        params = None
+
+        link_header = response.headers.get("Link", "")
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                url = part[part.find("<") + 1:part.find(">")]
+                break
+
+    return results
+
+
+def get_networks():
+    return meraki_get(
+        f"{BASE_URL}/organizations/{ORG_ID}/networks",
+        {"perPage": 1000}
+    )
+
+
+def get_network_devices(network_id):
+    return meraki_get(
+        f"{BASE_URL}/networks/{network_id}/devices",
+        {"perPage": 1000}
+    )
+
+
+def get_device_statuses():
+    return meraki_get(
+        f"{BASE_URL}/organizations/{ORG_ID}/devices/statuses",
+        {"perPage": 1000}
+    )
+
+
+def minutes_since(last_reported_at):
+    if not last_reported_at:
+        return ""
+
+    try:
+        last_seen = datetime.fromisoformat(last_reported_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return round((now - last_seen).total_seconds() / 60, 2)
+    except Exception:
+        return ""
+
+
+def main():
+    if not API_KEY:
+        raise ValueError("Set MERAKI_API_KEY environment variable first.")
+
+    print("Fetching networks...")
+    networks = get_networks()
+
+    if TARGET_NETWORKS:
+        networks = [n for n in networks if n.get("name") in TARGET_NETWORKS]
+
+    print(f"Networks selected: {len(networks)}")
+
+    print("Fetching device statuses...")
+    statuses = get_device_statuses()
+    status_map = {s.get("serial"): s for s in statuses}
+
+    output_file = "meraki_devices_firmware_status.csv"
+
+    total_devices = 0
+
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=[
+            "networkName",
+            "networkId",
+            "deviceName",
+            "serial",
+            "mac",
+            "lanIp",
+            "model",
+            "firmware",
+            "status",
+            "lastReportedAt",
+            "lastSeenMinutesAgo"
+        ])
+
+        writer.writeheader()
+
+        for network in networks:
+            network_id = network["id"]
+            network_name = network.get("name", "")
+
+            print(f"Fetching devices for: {network_name}")
+
+            try:
+                devices = get_network_devices(network_id)
+            except requests.exceptions.HTTPError as e:
+                print(f"Skipped {network_name}: {e}")
+                continue
+
+            print(f"  Devices found: {len(devices)}")
+            total_devices += len(devices)
+
+            for device in devices:
+                serial = device.get("serial")
+                status_info = status_map.get(serial, {})
+
+                writer.writerow({
+                    "networkName": network_name,
+                    "networkId": network_id,
+                    "deviceName": device.get("name", ""),
+                    "serial": serial,
+                    "mac": device.get("mac", ""),
+                    "lanIp": device.get("lanIp", ""),
+                    "model": device.get("model", ""),
+                    "firmware": device.get("firmware", ""),
+                    "status": status_info.get("status", ""),
+                    "lastReportedAt": status_info.get("lastReportedAt", ""),
+                    "lastSeenMinutesAgo": minutes_since(status_info.get("lastReportedAt"))
+                })
+
+    print(f"Devices exported: {total_devices}")
+    print(f"Export completed: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
